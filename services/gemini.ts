@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { SYSTEM_INSTRUCTION_JUDGE, FALLBACK_MODELS } from '../constants';
-import { ModelData } from '../types';
+import { ModelData, AnalysisResponse } from '../types';
 
 // Initialize the Gemini API client
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -8,8 +8,8 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 // Timeout setting for real-time fetches
 const SEARCH_TIMEOUT_MS = 150000;
 
-// Cache Configuration - Bumped to v9 to force re-fetch with new normalization logic
-const CACHE_KEY = 'codellm_leaderboard_cache_v9';
+// Cache Configuration - Bumped to v11
+const CACHE_KEY = 'codellm_leaderboard_cache_v11';
 const CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 Hours
 
 // Logging Callback Type
@@ -53,7 +53,6 @@ const inferProvider = (name: string, givenProvider?: string): string => {
   return 'Other';
 };
 
-// Helper: Generate a consistent color from a string (hash)
 const stringToColor = (str: string) => {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
@@ -63,7 +62,6 @@ const stringToColor = (str: string) => {
   return '#' + '00000'.substring(0, 6 - c.length) + c;
 };
 
-// Helper: Guess if a model is open source based on name if API returns null
 const inferOpenSource = (name: string, provider: string): boolean => {
   const n = name.toLowerCase();
   const p = provider.toLowerCase();
@@ -96,80 +94,62 @@ export const generateCodeResponse = async (prompt: string) => {
   }
 };
 
-export const generateComparisonAnalysis = async () => {
+export const generateComparisonAnalysis = async (models: ModelData[]): Promise<AnalysisResponse> => {
   try {
+    const modelsJson = JSON.stringify(models.slice(0, 8)); 
+    
+    const prompt = `
+      ACT AS: Senior AI Architect / CTO.
+      INPUT DATA (Real-time Leaderboard): ${modelsJson}
+      TASK: Analyze the provided model data. Ignore web search for this specific task. Produce a structured report in JSON.
+      OUTPUT JSON SCHEMA:
+      {
+        "executive_summary": "Summary text.",
+        "top_models": [{ "model_name": "", "rank": 1, "primary_advantage": "", "recommended_for": [], "compatible_tools": [] }],
+        "scenario_matrix": [{ "scenario": "", "suggested_model": "", "reasoning": "" }]
+      }
+    `;
+
     const response = await ai.models.generateContent({
       model: 'gemini-3-pro-preview', 
-      contents: "Use Google Search to find the current date and the latest LLM coding benchmarks (SWE-bench Verified, EvalPlus, LiveCodeBench) as of today. Compare DeepSeek R1, Claude 3.7 Sonnet, OpenAI o3-mini, and Qwen 2.5 Max. Which is the current King? Output a detailed Markdown report.",
+      contents: prompt,
       config: {
-        systemInstruction: SYSTEM_INSTRUCTION_JUDGE,
-        tools: [{ googleSearch: {} }], 
+        systemInstruction: "You are an expert analyst. Output strictly valid JSON.",
         thinkingConfig: { thinkingBudget: 2048 },
       }
     });
 
-    return {
-      markdown: response.text || "No analysis generated.",
-      groundingChunks: response.candidates?.[0]?.groundingMetadata?.groundingChunks
-    };
+    const text = response.text || "";
+    let report = null;
+    
+    try {
+      const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/\{[\s\S]*\}/);
+      const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : text;
+      report = JSON.parse(jsonStr);
+    } catch (e) {
+      console.error("Failed to parse analysis JSON", e);
+    }
+
+    return { markdown: text, report: report };
   } catch (error) {
     console.error("Error generating analysis:", error);
-    return { 
-      markdown: `Error fetching analysis: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again later.` 
-    };
+    return { markdown: `Error fetching analysis: ${error instanceof Error ? error.message : 'Unknown error'}.` };
   }
 };
 
-// NEW: Fetch real-time leaderboard data with Granular Logging
-export const fetchRealtimeLeaderboard = async (
-  forceRefresh = false, 
-  onLog?: LogCallback,
-  modelName: string = 'gemini-2.5-flash'
-): Promise<{ models: ModelData[], isLive: boolean, isCached?: boolean, error?: string }> => {
-  
-  const log = (msg: string) => {
-    const timestamp = new Date().toLocaleTimeString();
-    const fullMsg = `[${timestamp}] ${msg}`;
-    console.log(fullMsg);
-    if (onLog) onLog(fullMsg);
-  };
-
-  log(`Starting fetchRealtimeLeaderboard using ${modelName}...`);
-
-  if (!forceRefresh) {
-    log("Checking local cache (v9)...");
-    try {
-      const cachedRaw = localStorage.getItem(CACHE_KEY);
-      if (cachedRaw) {
-        const { timestamp, data } = JSON.parse(cachedRaw);
-        const age = Date.now() - timestamp;
-        if (age < CACHE_DURATION_MS && Array.isArray(data) && data.length > 0) {
-          log("Cache valid. Returning cached data.");
-          return { models: data, isLive: true, isCached: true };
-        }
-      }
-    } catch (e) {
-      log(`Cache read error: ${e}`);
-    }
-  } else {
-    log("Force refresh requested. Skipping cache.");
-  }
-
-  log(`Preparing API request (${modelName})...`);
-  
-  try {
-    // UPDATED PROMPT: Emphasize strict 0-100 percentage format and specific benchmarks
-    const prompt = `
-      Context: You are an AI Data Analyst.
+// Internal helper to execute the actual API call
+const executeLeaderboardSearch = async (modelName: string, log: LogCallback): Promise<ModelData[]> => {
+  const prompt = `
+      Context: You are a strict Data Analyst.
       TASK:
-      1. Search Google for the **LATEST** available "SWE-bench Verified Leaderboard" and "EvalPlus Leaderboard" and "LiveCodeBench".
-      2. Identify the **TOP 10 performing models** currently on the market.
+      1. Search Google for the **ACTUAL, CURRENT** "SWE-bench Verified Leaderboard", "EvalPlus Leaderboard" and "LiveCodeBench".
+      2. Identify the **TOP 10 performing models** that are *currently released*. Do NOT include unreleased or rumored models.
       3. Extract their specific scores.
       
-      CRITICAL DATA FORMATTING RULES:
-      - **Scores MUST be PERCENTAGES (0-100).** 
-      - Example: If a score is "0.75", output "75.0". Do NOT output decimals < 1.
-      - If a score is "62%", output "62.0".
+      CRITICAL RULES:
+      - **NO HALLUCINATIONS**: Do not invent scores for models that don't exist yet.
+      - **FORMAT**: Scores must be percentages (0-100). Example: 75.5, not 0.755.
+      - **MISSING DATA**: If specific data is missing, perform a targeted search. If still missing, use -1.
       
       OUTPUT FORMAT:
       Return ONLY a valid JSON array. No markdown.
@@ -189,20 +169,17 @@ export const fetchRealtimeLeaderboard = async (
           "color": "#HexCode"
         }
       ]
-      
-      NOTES:
-      - Make sure to find scores for "LiveCodeBench" specifically.
-      - If exact data is missing, use a reasonable estimate from the model's tier (e.g. ~70% for SOTA Pro models) rather than returning 0.
-      - Ensure specific models like DeepSeek R1, Claude 3.7, o3-mini, Qwen 2.5 Max are checked.
     `;
 
-    log(`Sending request to API (Timeout: ${SEARCH_TIMEOUT_MS}ms)...`);
+    log(`Sending request to API (${modelName}, Timeout: ${SEARCH_TIMEOUT_MS}ms)...`);
 
     const apiCall = ai.models.generateContent({
       model: modelName, 
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
+        // Only add thinking config if we are using a Pro model that supports it
+        thinkingConfig: modelName.includes('pro') ? { thinkingBudget: 2048 } : undefined
       }
     });
 
@@ -228,89 +205,145 @@ export const fetchRealtimeLeaderboard = async (
       }
     }
     
-    if (jsonStr) {
-      try {
-        log("Parsing JSON...");
-        const rawData = JSON.parse(jsonStr);
-        
-        if (Array.isArray(rawData)) {
-           if (rawData.length >= 1) {
-             // Helper: Find value and NORMALIZE decimals to percentages
-             const getValue = (obj: any, keys: string[]): number => {
-               let val = 0;
-               for (const k of keys) {
-                 if (obj[k] !== undefined) {
-                   val = Number(obj[k]);
-                   break;
-                 }
-                 const lowerKey = Object.keys(obj).find(ok => ok.toLowerCase() === k.toLowerCase());
-                 if (lowerKey && obj[lowerKey] !== undefined) {
-                   val = Number(obj[lowerKey]);
-                   break;
-                 }
-               }
-               // Fix: Convert 0.xx decimals to 0-100 scale automatically
-               // Assumption: Leaderboard scores are rarely < 1% for top models unless it's actually 0.
-               if (val > 0 && val <= 1.0) {
-                 return parseFloat((val * 100).toFixed(1));
-               }
-               return val;
-             };
+    if (!jsonStr) {
+      throw new Error("Invalid data format received (No JSON)");
+    }
 
-             const sanitizedModels: ModelData[] = rawData.map((m: any, idx: number) => {
-                const provider = inferProvider(m.name || '', m.provider);
-                
-                let finalColor = PROVIDER_COLORS[provider] || PROVIDER_COLORS[Object.keys(PROVIDER_COLORS).find(key => provider.includes(key)) || ''];
-                if (!finalColor) finalColor = stringToColor(m.name || 'unknown');
-                if (finalColor && (finalColor.toLowerCase() === '#ffffff' || finalColor === '#000000')) {
-                   finalColor = '#FFFFFF';
-                }
-
-                const isOpenSource = m.isOpenSource !== undefined 
-                  ? Boolean(m.isOpenSource) 
-                  : inferOpenSource(m.name || '', provider);
-
-                return {
-                  name: m.name || "Unknown Model",
-                  provider: provider,
-                  releaseDate: m.releaseDate || "2025-01",
-                  humanEval: getValue(m, ['humanEval', 'human_eval', 'HumanEval']),
-                  sweBench: getValue(m, ['sweBench', 'swe_bench', 'swe-bench', 'SWE-bench']),
-                  liveCodeBench: getValue(m, ['liveCodeBench', 'live_code_bench', 'LiveCodeBench']),
-                  contextWindow: m.contextWindow || "128K",
-                  inputPrice: m.inputPrice || "TBD",
-                  outputPrice: m.outputPrice || "TBD",
-                  strengths: Array.isArray(m.strengths) ? m.strengths : ["General Coding"],
-                  color: finalColor,
-                  isOpenSource: isOpenSource
-                };
-             });
-             
-             log(`PARSED MODELS: ${sanitizedModels.map(m => m.name).join(', ')}`);
-             
-             try {
-               localStorage.setItem(CACHE_KEY, JSON.stringify({
-                 timestamp: Date.now(),
-                 data: sanitizedModels
-               }));
-             } catch (e) {
-               log(`Cache save failed: ${e}`);
+    try {
+      log("Parsing JSON...");
+      const rawData = JSON.parse(jsonStr);
+      
+      if (Array.isArray(rawData) && rawData.length >= 1) {
+         const getValue = (obj: any, keys: string[]): number => {
+           let val = 0;
+           for (const k of keys) {
+             if (obj[k] !== undefined) {
+               val = Number(obj[k]);
+               break;
              }
-
-             return { models: sanitizedModels, isLive: true, isCached: false };
+             const lowerKey = Object.keys(obj).find(ok => ok.toLowerCase() === k.toLowerCase());
+             if (lowerKey && obj[lowerKey] !== undefined) {
+               val = Number(obj[lowerKey]);
+               break;
+             }
            }
+           if (val > 0 && val <= 1.0) {
+             return parseFloat((val * 100).toFixed(1));
+           }
+           return val;
+         };
+
+         const sanitizedModels: ModelData[] = rawData.map((m: any, idx: number) => {
+            const provider = inferProvider(m.name || '', m.provider);
+            let finalColor = PROVIDER_COLORS[provider] || PROVIDER_COLORS[Object.keys(PROVIDER_COLORS).find(key => provider.includes(key)) || ''];
+            if (!finalColor) finalColor = stringToColor(m.name || 'unknown');
+            if (finalColor && (finalColor.toLowerCase() === '#ffffff' || finalColor === '#000000')) {
+               finalColor = '#FFFFFF';
+            }
+            const isOpenSource = m.isOpenSource !== undefined 
+              ? Boolean(m.isOpenSource) 
+              : inferOpenSource(m.name || '', provider);
+
+            return {
+              name: m.name || "Unknown Model",
+              provider: provider,
+              releaseDate: m.releaseDate || "2024-01",
+              humanEval: getValue(m, ['humanEval', 'human_eval', 'HumanEval']),
+              sweBench: getValue(m, ['sweBench', 'swe_bench', 'swe-bench', 'SWE-bench']),
+              liveCodeBench: getValue(m, ['liveCodeBench', 'live_code_bench', 'LiveCodeBench']),
+              contextWindow: m.contextWindow || "128K",
+              inputPrice: m.inputPrice || "TBD",
+              outputPrice: m.outputPrice || "TBD",
+              strengths: Array.isArray(m.strengths) ? m.strengths : ["General Coding"],
+              color: finalColor,
+              isOpenSource: isOpenSource
+            };
+         });
+         
+         log(`PARSED MODELS: ${sanitizedModels.map(m => m.name).join(', ')}`);
+         return sanitizedModels;
+      }
+      throw new Error("JSON parsed but structure invalid");
+    } catch (e) {
+      log(`JSON Parse Error: ${e}`);
+      throw e;
+    }
+};
+
+// NEW: Fetch real-time leaderboard data with Granular Logging and Auto-Fallback
+export const fetchRealtimeLeaderboard = async (
+  forceRefresh = false, 
+  onLog?: LogCallback,
+  modelName: string = 'gemini-2.5-flash'
+): Promise<{ models: ModelData[], isLive: boolean, isCached?: boolean, usedModel?: string, error?: string }> => {
+  
+  const log = (msg: string) => {
+    const timestamp = new Date().toLocaleTimeString();
+    const fullMsg = `[${timestamp}] ${msg}`;
+    console.log(fullMsg);
+    if (onLog) onLog(fullMsg);
+  };
+
+  log(`Starting fetchRealtimeLeaderboard...`);
+
+  if (!forceRefresh) {
+    log("Checking local cache (v11)...");
+    try {
+      const cachedRaw = localStorage.getItem(CACHE_KEY);
+      if (cachedRaw) {
+        const { timestamp, data } = JSON.parse(cachedRaw);
+        const age = Date.now() - timestamp;
+        if (age < CACHE_DURATION_MS && Array.isArray(data) && data.length > 0) {
+          log("Cache valid. Returning cached data.");
+          return { models: data, isLive: true, isCached: true, usedModel: 'Cache' };
         }
-      } catch (e) {
-        log(`JSON Parse Error: ${e}`);
-        return { models: [], isLive: false, error: "Failed to parse AI response" };
+      }
+    } catch (e) {
+      log(`Cache read error: ${e}`);
+    }
+  } else {
+    log("Force refresh requested. Skipping cache.");
+  }
+
+  // ATTEMPT 1: Requested Model
+  try {
+    const data = await executeLeaderboardSearch(modelName, log);
+    
+    // Cache Success
+    try {
+       localStorage.setItem(CACHE_KEY, JSON.stringify({
+         timestamp: Date.now(),
+         data: data
+       }));
+    } catch (e) { log(`Cache save failed: ${e}`); }
+
+    return { models: data, isLive: true, isCached: false, usedModel: modelName };
+
+  } catch (error) {
+    let errMsg = error instanceof Error ? error.message : "Unknown error";
+    log(`Primary model (${modelName}) failed: ${errMsg}`);
+
+    // ATTEMPT 2: Fallback to Flash if we weren't already using it
+    if (modelName !== 'gemini-2.5-flash') {
+      log("⚠️ AUTO-FALLBACK: Switching to Gemini 2.5 Flash...");
+      try {
+        const data = await executeLeaderboardSearch('gemini-2.5-flash', log);
+        
+        try {
+           localStorage.setItem(CACHE_KEY, JSON.stringify({
+             timestamp: Date.now(),
+             data: data
+           }));
+        } catch (e) { log(`Cache save failed: ${e}`); }
+
+        return { models: data, isLive: true, isCached: false, usedModel: 'gemini-2.5-flash (Fallback)' };
+      } catch (fallbackError) {
+        const fbMsg = fallbackError instanceof Error ? fallbackError.message : "Unknown error";
+        log(`Fallback model failed too: ${fbMsg}`);
+        return { models: [], isLive: false, error: `All attempts failed. ${errMsg}` };
       }
     }
 
-    return { models: [], isLive: false, error: "Invalid data format received" };
-
-  } catch (error) {
-    const errMsg = error instanceof Error ? error.message : "Unknown network error";
-    log(`CRITICAL ERROR: ${errMsg}`);
     return { models: [], isLive: false, error: errMsg };
   }
 };

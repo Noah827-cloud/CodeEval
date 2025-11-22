@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { generateCodeResponse } from '../services/gemini';
 import { DEFAULT_PROMPT } from '../constants';
 
-const Playground: React.FC = () => {
+const Playground = () => {
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [output, setOutput] = useState<string>('');
   const [loading, setLoading] = useState(false);

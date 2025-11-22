@@ -6,10 +6,16 @@ import { ModelData } from '../types';
 
 type MetricType = 'sweBench' | 'humanEval' | 'liveCodeBench';
 
-const Leaderboard: React.FC = () => {
+interface LeaderboardProps {
+  onDataUpdate?: (data: ModelData[]) => void;
+}
+
+const Leaderboard = ({ onDataUpdate }: LeaderboardProps) => {
   const [activeMetric, setActiveMetric] = useState<MetricType>('sweBench');
   const [selectedProvider, setSelectedProvider] = useState<string>('All');
   const [fetchModel, setFetchModel] = useState<string>('gemini-2.5-flash');
+  const [actualModelUsed, setActualModelUsed] = useState<string>(''); // Track what was actually used
+  
   const [models, setModels] = useState<ModelData[]>([]); 
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isLive, setIsLive] = useState<boolean>(false);
@@ -25,27 +31,45 @@ const Leaderboard: React.FC = () => {
     setIsLoading(true);
     setErrorMsg(null);
     setLogs([]); 
+    setActualModelUsed('');
     
     const addLog = (msg: string) => {
       setLogs(prev => [...prev, msg]);
     };
     
     addLog(`Initializing data load using ${fetchModel}...`);
-    addLog("Cleared previous leaderboard data.");
-
-    const { models: fetchedModels, isLive: liveStatus, isCached: cachedStatus, error } = await fetchRealtimeLeaderboard(force, addLog, fetchModel);
     
+    const { models: fetchedModels, isLive: liveStatus, isCached: cachedStatus, usedModel, error } = await fetchRealtimeLeaderboard(force, addLog, fetchModel);
+    
+    if (usedModel) setActualModelUsed(usedModel);
+
     if (fetchedModels && fetchedModels.length > 0) {
       setModels(fetchedModels);
+      if (onDataUpdate) {
+        onDataUpdate(fetchedModels);
+      }
       addLog(`State updated with ${fetchedModels.length} models.`);
     } else {
       addLog("No data returned. Using Fallback.");
       setModels(FALLBACK_MODELS);
+      if (onDataUpdate) onDataUpdate(FALLBACK_MODELS);
     }
     
     setIsLive(liveStatus);
     setIsCached(!!cachedStatus);
-    if (error) setErrorMsg(error);
+    
+    if (error) {
+      if (error.includes('{') && error.includes('}')) {
+         try {
+           const errObj = JSON.parse(error.substring(error.indexOf('{')));
+           setErrorMsg(errObj.message || "API Error");
+         } catch(e) {
+           setErrorMsg(error);
+         }
+      } else {
+        setErrorMsg(error);
+      }
+    }
     setIsLoading(false);
   };
 
@@ -63,12 +87,10 @@ const Leaderboard: React.FC = () => {
   const highlights = useMemo(() => {
     if (models.length === 0) return null;
 
-    // 1. Price/Perf King: Lowest input price (parsed) with sweBench > 40
     let bestValue = models[0];
     let bestPrice = 9999;
 
     models.forEach(m => {
-      // Parse price string "$0.50" -> 0.50. "Open" -> 0. "TBD" -> 9999.
       let price = 9999;
       const pStr = m.inputPrice.toLowerCase();
       if (pStr.includes('open') || pStr.includes('free')) price = 0;
@@ -80,11 +102,11 @@ const Leaderboard: React.FC = () => {
       }
     });
 
-    // 2. Open Weights Leader: Highest sweBench among open source
     const openModels = models.filter(m => m.isOpenSource);
-    const bestOpen = openModels.sort((a, b) => b.sweBench - a.sweBench)[0];
+    const bestOpen = openModels.length > 0 
+        ? openModels.sort((a, b) => b.sweBench - a.sweBench)[0]
+        : null;
 
-    // 3. Reasoning King: Highest LiveCodeBench (or sweBench if missing)
     const bestReasoning = [...models].sort((a, b) => {
       const scoreA = a.liveCodeBench > 0 ? a.liveCodeBench : a.sweBench;
       const scoreB = b.liveCodeBench > 0 ? b.liveCodeBench : b.sweBench;
@@ -99,7 +121,6 @@ const Leaderboard: React.FC = () => {
     selectedProvider === 'All' || model.provider === selectedProvider
   );
   
-  // Filter out models that have 0 or N/A score for the current metric so the chart looks clean
   const chartData = filteredModels
     .filter(m => m[activeMetric] > 0)
     .sort((a, b) => b[activeMetric] - a[activeMetric]);
@@ -132,7 +153,7 @@ const Leaderboard: React.FC = () => {
              <svg className="w-5 h-5 text-amber-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
              <div>
                <h4 className="text-sm font-bold text-amber-200">Using Fallback Data</h4>
-               <p className="text-xs text-amber-400/80">{errorMsg}</p>
+               <p className="text-xs text-amber-400/80 break-all">{errorMsg}</p>
              </div>
            </div>
            <div className="flex gap-2">
@@ -166,6 +187,12 @@ const Leaderboard: React.FC = () => {
                  <span className={`px-2 py-0.5 border text-[10px] font-mono uppercase tracking-wide rounded flex items-center gap-1 ${isCached ? 'bg-blue-900/30 border-blue-700/50 text-blue-400' : 'bg-emerald-900/50 border-emerald-700/50 text-emerald-400'}`}>
                    {isCached ? 'Cached Data' : 'Live Update'}
                  </span>
+                 {actualModelUsed && actualModelUsed !== fetchModel && (
+                   <span className="px-2 py-0.5 bg-orange-900/50 border border-orange-700/50 text-orange-400 text-[10px] font-mono uppercase tracking-wide rounded">
+                     Auto-switched to Flash
+                   </span>
+                 )}
+                 
                  <div className="flex items-center bg-slate-800 rounded-lg p-0.5 border border-slate-700 ml-2">
                    <select value={fetchModel} onChange={(e) => setFetchModel(e.target.value)} className="bg-transparent text-xs text-slate-300 outline-none px-2 py-1 border-r border-slate-700">
                      <option value="gemini-2.5-flash">Gemini 2.5 Flash (Fast)</option>

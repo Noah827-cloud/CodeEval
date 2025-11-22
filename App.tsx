@@ -2,21 +2,24 @@ import React, { useState } from 'react';
 import Leaderboard from './components/Leaderboard';
 import Playground from './components/Playground';
 import Analysis from './components/Analysis';
-import { Tab } from './types';
+import { Tab, ModelData } from './types';
+import { FALLBACK_MODELS } from './constants';
 
-const App: React.FC = () => {
+const App = () => {
   const [activeTab, setActiveTab] = useState<Tab>(Tab.LEADERBOARD);
+  // Lifted state to share data between Leaderboard (Producer) and Analysis (Consumer)
+  const [sharedModels, setSharedModels] = useState<ModelData[]>(FALLBACK_MODELS);
 
   const renderContent = () => {
     switch (activeTab) {
       case Tab.LEADERBOARD:
-        return <Leaderboard />;
+        return <Leaderboard onDataUpdate={setSharedModels} />;
       case Tab.PLAYGROUND:
         return <Playground />;
       case Tab.ANALYSIS:
-        return <Analysis />;
+        return <Analysis models={sharedModels} />;
       default:
-        return <Leaderboard />;
+        return <Leaderboard onDataUpdate={setSharedModels} />;
     }
   };
 
