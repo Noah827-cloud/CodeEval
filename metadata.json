@@ -1,0 +1,5 @@
+{
+  "name": "CodeLLM Evaluator",
+  "description": "A comprehensive dashboard to evaluate and compare the top LLMs for software engineering, featuring interactive benchmarks and a live coding playground powered by Gemini 3 Pro.",
+  "requestFramePermissions": []
+}
